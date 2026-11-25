@@ -32,7 +32,7 @@ Your configuration is kept, and the previous version is restored if the new one 
 
 | File | Contents |
 | --- | --- |
-| `/etc/aduana/rules.conf` | Clients and rules. See [rules.example.conf](rules.example.conf). |
+| `/etc/aduana/rules.conf` | Clients and rules. See [docs/rules.md](docs/rules.md) and [rules.example.conf](rules.example.conf). |
 | `/etc/aduana/secrets.env` | Secrets used by the rules. |
 | `/etc/aduana/aduana.env` | Listen address. Change it by running the installer with `--listen`. |
 | `/etc/aduana/ca.crt` | CA certificate to install on the clients. |

@@ -9,6 +9,7 @@ use std::path::Path;
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SecretStore {
     values: BTreeMap<String, String>,
+    extra_redactions: Vec<String>,
 }
 
 impl fmt::Debug for SecretStore {
@@ -37,7 +38,10 @@ impl SecretStore {
             validate_secret_value(&key, &val)?;
             values.insert(key, val);
         }
-        Ok(Self { values })
+        Ok(Self {
+            values,
+            extra_redactions: Vec::new(),
+        })
     }
 
     /// Loads secrets from a `.env` file. Fails if the file does not exist or is invalid.
@@ -86,7 +90,10 @@ impl SecretStore {
             values.insert(key.to_string(), val);
         }
 
-        Ok(Self { values })
+        Ok(Self {
+            values,
+            extra_redactions: Vec::new(),
+        })
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -114,15 +121,28 @@ impl SecretStore {
             .collect()
     }
 
-    /// Replaces any exact occurrence of the loaded secret values with `[REDACTED]`.
+    /// Returns a clone of this store that also redacts derived secret values (e.g. Base64-encoded
+    /// credentials) in logs, without exposing them through `get()`.
+    pub fn with_extra_redactions(&self, extra: impl IntoIterator<Item = String>) -> Self {
+        let mut cloned = self.clone();
+        for val in extra {
+            if !val.is_empty() && !cloned.extra_redactions.contains(&val) {
+                cloned.extra_redactions.push(val);
+            }
+        }
+        cloned
+    }
+
+    /// Replaces any exact occurrence of the loaded secret values (and derived values) with `[REDACTED]`.
     pub fn redact(&self, input: &str) -> String {
-        if self.values.is_empty() || input.is_empty() {
+        if (self.values.is_empty() && self.extra_redactions.is_empty()) || input.is_empty() {
             return input.to_string();
         }
         // Sort from longest to shortest to avoid partial redactions when one secret contains another.
         let mut secret_vals: Vec<&str> = self
             .values
             .values()
+            .chain(self.extra_redactions.iter())
             .map(String::as_str)
             .filter(|v| !v.is_empty())
             .collect();

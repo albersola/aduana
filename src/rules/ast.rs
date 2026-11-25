@@ -183,13 +183,7 @@ impl Rule {
             if let Transform::SetHeader { value, .. } | Transform::ReplaceHeader { value, .. } =
                 transform
             {
-                for part in &value.parts {
-                    if let TemplatePart::Secret(name) = part
-                        && !out.contains(&name.as_str())
-                    {
-                        out.push(name.as_str());
-                    }
-                }
+                value.collect_referenced_secrets(&mut out);
             }
         }
         out
@@ -454,68 +448,63 @@ pub enum Transform {
     },
 }
 
-/// Value template with `${secret.x}` and `${client.name}` variables.
+/// Value template with `${secret.x}`, `${client.name}` and `${base64(...)}` expressions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueTemplate {
     pub parts: Vec<TemplatePart>,
 }
 
 impl ValueTemplate {
-    /// Indicates whether the template references any secret.
+    /// Indicates whether the template references any secret (including inside `${base64(...)}`).
     pub fn uses_secrets(&self) -> bool {
-        self.parts
-            .iter()
-            .any(|p| matches!(p, TemplatePart::Secret(_)))
+        parts_use_secrets(&self.parts)
     }
 
-    /// Resolves the template by substituting `${client.name}` and the secrets through `lookup_secret`.
-    pub fn resolve<F>(&self, client_name: &str, mut lookup_secret: F) -> Result<String, String>
+    /// Appends secret names referenced by this template (in order, without duplicates).
+    pub fn collect_referenced_secrets<'a>(&'a self, out: &mut Vec<&'a str>) {
+        collect_parts_secrets(&self.parts, out);
+    }
+
+    /// Resolves the template by substituting `${client.name}`, `${secret.*}` and `${base64(...)}`.
+    pub fn resolve<F>(&self, client_name: &str, lookup_secret: F) -> Result<String, String>
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let mut out = String::new();
-        for part in &self.parts {
-            match part {
-                TemplatePart::Literal(s) => out.push_str(s),
-                TemplatePart::ClientName => out.push_str(client_name),
-                TemplatePart::Secret(secret_name) => {
-                    let secret = lookup_secret(secret_name)
-                        .ok_or_else(|| format!("secret not found: {secret_name}"))?;
-                    out.push_str(&secret);
-                }
-            }
-        }
-        Ok(out)
+        self.resolve_with_redactions(client_name, lookup_secret)
+            .map(|(value, _)| value)
+    }
+
+    /// Resolves the template and also returns any derived secret values (e.g. Base64-encoded
+    /// segments containing a secret) so logs can redact them alongside raw secrets.
+    pub fn resolve_with_redactions<F>(
+        &self,
+        client_name: &str,
+        mut lookup_secret: F,
+    ) -> Result<(String, Vec<String>), String>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let mut derived_secrets = Vec::new();
+        let value = resolve_parts(
+            &self.parts,
+            client_name,
+            &mut lookup_secret,
+            &mut derived_secrets,
+        )?;
+        Ok((value, derived_secrets))
     }
 
     /// Renders the template resolving `${client.name}` but keeping the secrets redacted.
     pub fn render_redacted(&self, client_name: &str) -> String {
         let mut out = String::new();
-        for part in &self.parts {
-            match part {
-                TemplatePart::Literal(s) => out.push_str(s),
-                TemplatePart::ClientName => out.push_str(client_name),
-                TemplatePart::Secret(secret_name) => {
-                    out.push_str("${secret.");
-                    out.push_str(secret_name);
-                    out.push('}');
-                }
-            }
-        }
+        render_parts_redacted(&self.parts, client_name, &mut out);
         out
     }
 }
 
 impl fmt::Display for ValueTemplate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for part in &self.parts {
-            match part {
-                TemplatePart::Literal(s) => f.write_str(s)?,
-                TemplatePart::ClientName => f.write_str("${client.name}")?,
-                TemplatePart::Secret(name) => write!(f, "${{secret.{name}}}")?,
-            }
-        }
-        Ok(())
+        write_parts_display(&self.parts, f)
     }
 }
 
@@ -525,6 +514,128 @@ pub enum TemplatePart {
     Literal(String),
     ClientName,
     Secret(String),
+    Base64(Vec<TemplatePart>),
+}
+
+fn parts_use_secrets(parts: &[TemplatePart]) -> bool {
+    parts.iter().any(|p| match p {
+        TemplatePart::Secret(_) => true,
+        TemplatePart::Base64(inner) => parts_use_secrets(inner),
+        TemplatePart::Literal(_) | TemplatePart::ClientName => false,
+    })
+}
+
+fn collect_parts_secrets<'a>(parts: &'a [TemplatePart], out: &mut Vec<&'a str>) {
+    for part in parts {
+        match part {
+            TemplatePart::Secret(name) => {
+                if !out.contains(&name.as_str()) {
+                    out.push(name.as_str());
+                }
+            }
+            TemplatePart::Base64(inner) => collect_parts_secrets(inner, out),
+            TemplatePart::Literal(_) | TemplatePart::ClientName => {}
+        }
+    }
+}
+
+fn resolve_parts<F>(
+    parts: &[TemplatePart],
+    client_name: &str,
+    lookup_secret: &mut F,
+    derived_secrets: &mut Vec<String>,
+) -> Result<String, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            TemplatePart::Literal(s) => out.push_str(s),
+            TemplatePart::ClientName => out.push_str(client_name),
+            TemplatePart::Secret(secret_name) => {
+                let secret = lookup_secret(secret_name)
+                    .ok_or_else(|| format!("secret not found: {secret_name}"))?;
+                out.push_str(&secret);
+            }
+            TemplatePart::Base64(inner) => {
+                let plain = resolve_parts(inner, client_name, lookup_secret, derived_secrets)?;
+                let encoded = encode_base64(plain.as_bytes());
+                if parts_use_secrets(inner) && !encoded.is_empty() {
+                    derived_secrets.push(encoded.clone());
+                }
+                out.push_str(&encoded);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn render_parts_redacted(parts: &[TemplatePart], client_name: &str, out: &mut String) {
+    for part in parts {
+        match part {
+            TemplatePart::Literal(s) => out.push_str(s),
+            TemplatePart::ClientName => out.push_str(client_name),
+            TemplatePart::Secret(secret_name) => {
+                out.push_str("${secret.");
+                out.push_str(secret_name);
+                out.push('}');
+            }
+            TemplatePart::Base64(inner) => {
+                out.push_str("${base64(");
+                render_parts_redacted(inner, client_name, out);
+                out.push_str(")}");
+            }
+        }
+    }
+}
+
+fn write_parts_display(parts: &[TemplatePart], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    for part in parts {
+        match part {
+            TemplatePart::Literal(s) => f.write_str(s)?,
+            TemplatePart::ClientName => f.write_str("${client.name}")?,
+            TemplatePart::Secret(name) => write!(f, "${{secret.{name}}}")?,
+            TemplatePart::Base64(inner) => {
+                f.write_str("${base64(")?;
+                write_parts_display(inner, f)?;
+                f.write_str(")}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encodes raw bytes using standard RFC 4648 Base64 with `=` padding.
+pub fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let (chunks, remainder) = input.as_chunks::<3>();
+    for chunk in chunks {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        out.push(TABLE[(n & 0x3f) as usize] as char);
+    }
+    match remainder {
+        [a] => {
+            let n = (*a as u32) << 16;
+            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        [a, b] => {
+            let n = ((*a as u32) << 16) | ((*b as u32) << 8);
+            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Incoming request to evaluate against a `Policy`.
@@ -558,26 +669,44 @@ pub struct AllowedMatch {
 }
 
 impl AllowedMatch {
-    /// Resolves all transforms by substituting `${client.name}` and `${secret.*}`.
+    /// Resolves all transforms by substituting `${client.name}`, `${secret.*}` and `${base64(...)}`.
     pub fn resolve_transforms<F>(
         &self,
-        mut lookup_secret: F,
+        lookup_secret: F,
     ) -> Result<Vec<ResolvedTransform>, String>
     where
         F: FnMut(&str) -> Option<String>,
     {
+        self.resolve_transforms_with_redactions(lookup_secret)
+            .map(|(transforms, _)| transforms)
+    }
+
+    /// Resolves all transforms and returns any derived secret values (such as Base64-encoded
+    /// secrets) that should also be redacted from logs.
+    pub fn resolve_transforms_with_redactions<F>(
+        &self,
+        mut lookup_secret: F,
+    ) -> Result<(Vec<ResolvedTransform>, Vec<String>), String>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
         let mut resolved = Vec::with_capacity(self.transforms.len());
+        let mut derived_secrets = Vec::new();
         for t in &self.transforms {
             match t {
                 Transform::SetHeader { name, value } => {
-                    let val = value.resolve(&self.client_name, &mut lookup_secret)?;
+                    let (val, extra) =
+                        value.resolve_with_redactions(&self.client_name, &mut lookup_secret)?;
+                    derived_secrets.extend(extra);
                     resolved.push(ResolvedTransform::SetHeader {
                         name: name.clone(),
                         value: val,
                     });
                 }
                 Transform::ReplaceHeader { name, value } => {
-                    let val = value.resolve(&self.client_name, &mut lookup_secret)?;
+                    let (val, extra) =
+                        value.resolve_with_redactions(&self.client_name, &mut lookup_secret)?;
+                    derived_secrets.extend(extra);
                     resolved.push(ResolvedTransform::ReplaceHeader {
                         name: name.clone(),
                         value: val,
@@ -588,7 +717,7 @@ impl AllowedMatch {
                 }
             }
         }
-        Ok(resolved)
+        Ok((resolved, derived_secrets))
     }
 }
 

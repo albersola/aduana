@@ -10,7 +10,7 @@ pub use ast::{
     AllowRule, AllowedMatch, Client, ClientAddr, ConnectDecision, Decision, DenyReason,
     EvalRequest, FromMatcher, HostPattern, HttpMethod, MethodMatcher, ParseError, PathPattern,
     PathSegment, Policy, ResolvedTransform, Rule, Scheme, Span, Target, TemplatePart, Transform,
-    ValueTemplate,
+    ValueTemplate, encode_base64,
 };
 pub use eval::apply_transforms;
 pub use format::{format_client, format_policy, format_rule};

@@ -712,6 +712,15 @@ fn parse_value_template(raw: &str, line_num: usize) -> Result<ValueTemplate, Par
         ));
     }
 
+    let parts = parse_value_template_parts(raw, line_num, true)?;
+    Ok(ValueTemplate { parts })
+}
+
+fn parse_value_template_parts(
+    raw: &str,
+    line_num: usize,
+    allow_base64: bool,
+) -> Result<Vec<TemplatePart>, ParseError> {
     let mut parts = Vec::new();
     let mut literal = String::new();
     let bytes = raw.as_bytes();
@@ -723,6 +732,28 @@ fn parse_value_template(raw: &str, line_num: usize) -> Result<ValueTemplate, Par
                 parts.push(TemplatePart::Literal(std::mem::take(&mut literal)));
             }
             let start = i + 2;
+            if raw[start..].starts_with("base64(") {
+                if !allow_base64 {
+                    return Err(ParseError::new(
+                        line_num,
+                        "nested '${base64(...)}' is not allowed",
+                    ));
+                }
+                let inner_start = start + "base64(".len();
+                let inner_end = find_base64_end(raw, inner_start, line_num)?;
+                let inner_raw = &raw[inner_start..inner_end];
+                if inner_raw.is_empty() {
+                    return Err(ParseError::new(
+                        line_num,
+                        "'${base64(...)}' must not be empty",
+                    ));
+                }
+                let inner_parts = parse_value_template_parts(inner_raw, line_num, false)?;
+                parts.push(TemplatePart::Base64(inner_parts));
+                i = inner_end + 2; // skip `)}`
+                continue;
+            }
+
             let Some(rel_end) = raw[start..].find('}') else {
                 return Err(ParseError::new(
                     line_num,
@@ -739,7 +770,7 @@ fn parse_value_template(raw: &str, line_num: usize) -> Result<ValueTemplate, Par
                 return Err(ParseError::new(
                     line_num,
                     format!(
-                        "unknown variable '${{{expr}}}' (only '${{secret.<name>}}' and '${{client.name}}' are allowed)"
+                        "unknown variable '${{{expr}}}' (only '${{secret.<name>}}', '${{client.name}}' and '${{base64(...)}}' are allowed)"
                     ),
                 ));
             }
@@ -755,7 +786,41 @@ fn parse_value_template(raw: &str, line_num: usize) -> Result<ValueTemplate, Par
         parts.push(TemplatePart::Literal(literal));
     }
 
-    Ok(ValueTemplate { parts })
+    Ok(parts)
+}
+
+fn find_base64_end(raw: &str, inner_start: usize, line_num: usize) -> Result<usize, ParseError> {
+    let bytes = raw.as_bytes();
+    let mut j = inner_start;
+    let mut brace_depth: usize = 0;
+
+    while j < bytes.len() {
+        if bytes[j] == b'$' && j + 1 < bytes.len() && bytes[j + 1] == b'{' {
+            brace_depth += 1;
+            j += 2;
+        } else if bytes[j] == b'}' && brace_depth > 0 {
+            brace_depth -= 1;
+            j += 1;
+        } else if brace_depth == 0
+            && bytes[j] == b')'
+            && j + 1 < bytes.len()
+            && bytes[j + 1] == b'}'
+        {
+            return Ok(j);
+        } else if brace_depth == 0 && bytes[j] == b'}' {
+            return Err(ParseError::new(
+                line_num,
+                "unclosed '${base64(...)}' in header value",
+            ));
+        } else {
+            j += 1;
+        }
+    }
+
+    Err(ParseError::new(
+        line_num,
+        "unclosed '${base64(...)}' in header value",
+    ))
 }
 
 fn validate_identifier(s: &str, line_num: usize, kind: &str) -> Result<(), ParseError> {
