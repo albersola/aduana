@@ -38,7 +38,7 @@ use crate::secrets::SecretStore;
 pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:3128";
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
