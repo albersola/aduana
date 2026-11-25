@@ -11,6 +11,10 @@ Outbound HTTP/HTTPS proxy for self-hosted servers: inspects, limits, logs and tr
 
 Use [Conventional Commits](https://www.conventionalcommits.org/) (semantic commits): `type(scope): short description`, with types such as `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `build` and `ci`. Write messages in English, in the imperative mood.
 
+## Releases
+
+Release tags use bare `X.Y.Z` format without a `v` prefix (enforced by `.github/workflows/release.yml`, starting at `0.0.1`). Each release only increments `Z` unless explicitly instructed to bump `X` or `Y`.
+
 ## Documentation index
 
 | Document | Description | When to read it |
