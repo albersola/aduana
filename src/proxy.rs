@@ -675,10 +675,10 @@ impl ProxyServer {
         };
 
         // Resolve transforms and secrets ONLY after authorization.
-        let resolved_transforms = match matched.resolve_transforms(|name| {
-            state.secrets.get(name).map(str::to_string)
-        }) {
-            Ok(t) => t,
+        let (resolved_transforms, derived_secrets) = match matched
+            .resolve_transforms_with_redactions(|name| state.secrets.get(name).map(str::to_string))
+        {
+            Ok(pair) => pair,
             Err(err) => {
                 self.log_deny(
                     Some(matched.client_name),
@@ -697,6 +697,11 @@ impl ProxyServer {
                     "internal secrets configuration error\n",
                 );
             }
+        };
+        let log_secrets = if derived_secrets.is_empty() {
+            state.secrets.clone()
+        } else {
+            state.secrets.with_extra_redactions(derived_secrets)
         };
 
         // Connect with anti-SSRF / anti-DNS-rebinding validation (single resolution).
@@ -742,7 +747,7 @@ impl ProxyServer {
             host_lower,
             port,
             &resolved_transforms,
-            &state.secrets,
+            &log_secrets,
         );
 
         let origin_uri: Uri = match path_and_query.parse() {
@@ -865,7 +870,7 @@ impl ProxyServer {
         let logged_resp_headers = if matched.log_body {
             Some(redact_headers(
                 &headers_to_pairs(&clean_resp_headers),
-                &state.secrets,
+                &log_secrets,
             ))
         } else {
             None
@@ -878,7 +883,7 @@ impl ProxyServer {
 
         if matched.log_body {
             let logger = Arc::clone(&self.logger);
-            let secrets = state.secrets.clone();
+            let secrets = log_secrets;
             let req_cap = Arc::clone(&req_capture);
             let resp_cap = Arc::new(Mutex::new(BodyCapture::default()));
             let client_name = matched.client_name;

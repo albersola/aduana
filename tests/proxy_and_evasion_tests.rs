@@ -29,7 +29,7 @@ use aduana::certs::{
 use aduana::logging::{LogFilter, MAX_LOGGED_BODY_BYTES, query_logs};
 use aduana::net::ConnectPolicy;
 use aduana::proxy::{ProxyConfig, ProxyServer};
-use aduana::rules::{HostPattern, parse_rules};
+use aduana::rules::{HostPattern, encode_base64, parse_rules};
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -571,6 +571,252 @@ rule plain-http {
         .as_deref()
         .unwrap()
         .contains("...[truncated,"));
+
+    let _ = shutdown_tx.send(true);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn end_to_end_github_git_and_api_gateway() {
+    let dir = temp_dir("github-gateway");
+    let rules_path = dir.join("rules.conf");
+    let secrets_path = dir.join("secrets.env");
+    let log_dir = dir.join("logs");
+
+    let aduana_ca_key = dir.join("aduana-ca.key");
+    let aduana_ca_cert = dir.join("aduana-ca.crt");
+    let aduana_certs_dir = dir.join("aduana-certs");
+    generate_ca(&aduana_ca_key, &aduana_ca_cert, "Aduana GitHub CA", 365).unwrap();
+
+    let upstream_ca_key = dir.join("upstream-ca.key");
+    let upstream_ca_cert = dir.join("upstream-ca.crt");
+    let upstream_certs_dir = dir.join("upstream-certs");
+    generate_ca(&upstream_ca_key, &upstream_ca_cert, "Upstream GitHub CA", 365).unwrap();
+
+    let (git_crt, git_key) = issue_host_cert(
+        &HostPattern::Exact("github.com".into()),
+        &upstream_ca_key,
+        &upstream_ca_cert,
+        &upstream_certs_dir,
+        90,
+    )
+    .unwrap();
+    let (api_crt, api_key) = issue_host_cert(
+        &HostPattern::Exact("api.github.com".into()),
+        &upstream_ca_key,
+        &upstream_ca_cert,
+        &upstream_certs_dir,
+        90,
+    )
+    .unwrap();
+
+    let git_hits = Arc::new(AtomicUsize::new(0));
+    let (git_addr, _git_stop) =
+        spawn_https_echo_server(git_crt, git_key, Arc::clone(&git_hits)).await;
+
+    let api_hits = Arc::new(AtomicUsize::new(0));
+    let (api_addr, _api_stop) =
+        spawn_https_echo_server(api_crt, api_key, Arc::clone(&api_hits)).await;
+
+    let real_pat = "ghp_REAL_GITHUB_GATEWAY_PAT";
+    let expected_b64 = encode_base64(format!("x-access-token:{real_pat}").as_bytes());
+    let expected_basic = format!("Basic {expected_b64}");
+
+    fs::write(
+        &rules_path,
+        r#"
+client dev-vm 127.0.0.1
+
+rule github-git {
+  from  dev-vm
+  to    github.com
+  allow GET  /*/*/info/refs
+  allow POST /*/*/git-upload-pack
+  allow POST /*/*/git-receive-pack
+  remove header cookie
+  set header authorization "Basic ${base64(x-access-token:${secret.github_pat})}"
+  set header x-derived-b64 "${base64(x-access-token:${secret.github_pat})}"
+  log body
+}
+
+rule github-api {
+  from  dev-vm
+  to    api.github.com
+  allow GET,HEAD,POST,PUT,PATCH,DELETE /**
+  remove header cookie
+  set header authorization "Bearer ${secret.github_pat}"
+  log body
+}
+"#,
+    )
+    .unwrap();
+    fs::write(&secrets_path, format!("github_pat={real_pat}\n")).unwrap();
+
+    let policy = parse_rules(&fs::read_to_string(&rules_path).unwrap()).unwrap();
+    ensure_policy_certs(
+        &policy,
+        &aduana_ca_key,
+        &aduana_ca_cert,
+        &aduana_certs_dir,
+        90,
+        30,
+    )
+    .unwrap();
+
+    let mut connect_policy = ConnectPolicy {
+        allow_private_ips: true,
+        ..Default::default()
+    };
+    connect_policy
+        .host_overrides
+        .insert(("github.com".into(), 443), git_addr);
+    connect_policy
+        .host_overrides
+        .insert(("api.github.com".into(), 443), api_addr);
+
+    let cfg = ProxyConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        rules_path,
+        certs_dir: aduana_certs_dir,
+        secrets_path: Some(secrets_path),
+        log_dir: Some(log_dir.clone()),
+        echo_stderr: false,
+        connect_policy,
+        extra_upstream_ca: Some(upstream_ca_cert),
+        ..Default::default()
+    };
+
+    let server = ProxyServer::new(cfg).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = server.serve_listener(listener, shutdown_rx).await;
+    });
+
+    // 1. Git smart HTTP discovery (no Authorization from client, Cookie stripped)
+    let (_, refs_resp) = send_via_https_proxy(
+        proxy_addr,
+        &aduana_ca_cert,
+        "github.com:443",
+        "github.com",
+        "GET /acme/demo.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+         Host: github.com\r\n\
+         Cookie: session=should-be-stripped\r\n\
+         Connection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let (hdr, body) = split_http_response(&refs_resp);
+    assert!(hdr.starts_with("HTTP/1.1 200"), "got:\n{refs_resp}");
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(json["path"], "/acme/demo.git/info/refs?service=git-upload-pack");
+    assert_eq!(json["headers"]["authorization"], expected_basic);
+    assert!(json["headers"].get("cookie").is_none());
+
+    // 2. Git upload-pack & receive-pack overwrite dummy client Authorization with Basic PAT
+    for endpoint in ["/acme/demo.git/git-upload-pack", "/acme/demo.git/git-receive-pack"] {
+        let (_, pack_resp) = send_via_https_proxy(
+            proxy_addr,
+            &aduana_ca_cert,
+            "github.com:443",
+            "github.com",
+            &format!(
+                "POST {endpoint} HTTP/1.1\r\n\
+                 Host: github.com\r\n\
+                 Authorization: Bearer dummy-vm-token\r\n\
+                 Content-Length: 4\r\n\
+                 Connection: close\r\n\r\npack"
+            ),
+        )
+        .await
+        .unwrap();
+        let (phdr, pbody) = split_http_response(&pack_resp);
+        assert!(phdr.starts_with("HTTP/1.1 200"), "got:\n{pack_resp}");
+        let pjson: serde_json::Value = serde_json::from_str(pbody).unwrap();
+        assert_eq!(pjson["headers"]["authorization"], expected_basic);
+        assert_eq!(pjson["body"], "pack");
+    }
+
+    // 3. Disallowed GitHub web/repo paths are blocked without hitting upstream
+    let hits_before = git_hits.load(Ordering::SeqCst);
+    for blocked in ["/acme/demo.git/HEAD", "/settings/tokens"] {
+        let (_, denied) = send_via_https_proxy(
+            proxy_addr,
+            &aduana_ca_cert,
+            "github.com:443",
+            "github.com",
+            &format!("GET {blocked} HTTP/1.1\r\nHost: github.com\r\nConnection: close\r\n\r\n"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            denied.starts_with("HTTP/1.1 403"),
+            "expected 403 for {blocked}, got:\n{denied}"
+        );
+    }
+    assert_eq!(git_hits.load(Ordering::SeqCst), hits_before);
+
+    // 4. GitHub REST API (gh style `token dummy`) -> Bearer real PAT, query preserved
+    let (_, rest_resp) = send_via_https_proxy(
+        proxy_addr,
+        &aduana_ca_cert,
+        "api.github.com:443",
+        "api.github.com",
+        "GET /repos/acme/demo/pulls?state=open HTTP/1.1\r\n\
+         Host: api.github.com\r\n\
+         Authorization: token dummy-gh-token\r\n\
+         Cookie: gh_sess=strip-me\r\n\
+         Connection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let (rhdr, rbody) = split_http_response(&rest_resp);
+    assert!(rhdr.starts_with("HTTP/1.1 200"), "got:\n{rest_resp}");
+    let rjson: serde_json::Value = serde_json::from_str(rbody).unwrap();
+    assert_eq!(rjson["path"], "/repos/acme/demo/pulls?state=open");
+    assert_eq!(rjson["headers"]["authorization"], format!("Bearer {real_pat}"));
+    assert!(rjson["headers"].get("cookie").is_none());
+
+    // 5. GitHub GraphQL API -> Bearer real PAT
+    let gql_payload = r#"{"query":"{ viewer { login } }"}"#;
+    let (_, gql_resp) = send_via_https_proxy(
+        proxy_addr,
+        &aduana_ca_cert,
+        "api.github.com:443",
+        "api.github.com",
+        &format!(
+            "POST /graphql HTTP/1.1\r\n\
+             Host: api.github.com\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{gql_payload}",
+            gql_payload.len()
+        ),
+    )
+    .await
+    .unwrap();
+    let (ghdr, gbody) = split_http_response(&gql_resp);
+    assert!(ghdr.starts_with("HTTP/1.1 200"), "got:\n{gql_resp}");
+    let gjson: serde_json::Value = serde_json::from_str(gbody).unwrap();
+    assert_eq!(gjson["headers"]["authorization"], format!("Bearer {real_pat}"));
+    assert_eq!(gjson["body"], gql_payload);
+
+    // 6. Logs must NEVER leak either the raw PAT or its Base64-encoded form (even in headers or echoed response bodies)
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let events = query_logs(&log_dir, &LogFilter::default()).unwrap();
+    assert!(events.len() >= 7);
+    for entry in fs::read_dir(&log_dir).unwrap().flatten() {
+        let raw_log = fs::read_to_string(entry.path()).unwrap();
+        assert!(
+            !raw_log.contains(real_pat),
+            "RAW GITHUB PAT LEAKED IN LOGS!"
+        );
+        assert!(
+            !raw_log.contains(&expected_b64),
+            "BASE64-ENCODED GITHUB PAT LEAKED IN LOGS!"
+        );
+    }
 
     let _ = shutdown_tx.send(true);
     let _ = fs::remove_dir_all(&dir);

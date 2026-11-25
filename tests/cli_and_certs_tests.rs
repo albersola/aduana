@@ -152,6 +152,92 @@ rule github {
 }
 
 #[test]
+fn cli_check_and_test_base64_basic_auth() {
+    let dir = temp_dir("cli-base64");
+    let rules_path = dir.join("rules.conf");
+    let secrets_path = dir.join("secrets.env");
+
+    fs::write(
+        &rules_path,
+        r#"
+client dev-vm 10.0.10.21
+
+rule github-git {
+  from  dev-vm
+  to    github.com
+  allow GET  /*/*/info/refs
+  allow POST /*/*/git-upload-pack
+  allow POST /*/*/git-receive-pack
+  remove header cookie
+  set header authorization "Basic ${base64(x-access-token:${secret.github_pat})}"
+}
+"#,
+    )
+    .unwrap();
+    fs::write(&secrets_path, "github_pat=ghp_super_secret\n").unwrap();
+
+    let ok = Command::new(bin())
+        .args([
+            "check",
+            "-c",
+            rules_path.to_str().unwrap(),
+            "--secrets-file",
+            secrets_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        ok.status.success(),
+        "check should pass: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    let empty_secrets = dir.join("empty.env");
+    fs::write(&empty_secrets, "# empty\n").unwrap();
+    let missing = Command::new(bin())
+        .args([
+            "check",
+            "-c",
+            rules_path.to_str().unwrap(),
+            "--secrets-file",
+            empty_secrets.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("github_pat"));
+
+    let test_out = Command::new(bin())
+        .args([
+            "test",
+            "-c",
+            rules_path.to_str().unwrap(),
+            "--json",
+            "--from",
+            "dev-vm",
+            "-H",
+            "Cookie: session=abc",
+            "GET",
+            "https://github.com/acme/demo.git/info/refs?service=git-upload-pack",
+        ])
+        .output()
+        .unwrap();
+    assert!(test_out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&test_out.stdout).unwrap();
+    assert_eq!(json["decision"], "allow");
+    assert_eq!(json["rule"], "github-git");
+    let headers = json["resulting_headers"].as_array().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0][0], "authorization");
+    assert_eq!(
+        headers[0][1],
+        "Basic ${base64(x-access-token:${secret.github_pat})}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn cli_apply_issues_reuses_and_renews_certs() {
     let dir = temp_dir("cli-apply");
     let ca_key = dir.join("ca.key");

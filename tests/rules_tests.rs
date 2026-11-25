@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use aduana::rules::{
     ConnectDecision, Decision, DenyReason, EvalRequest, HostPattern, ResolvedTransform, Scheme,
-    Transform, apply_transforms, format_policy, parse_rules, validate_request_path,
+    Transform, apply_transforms, encode_base64, format_policy, parse_rules, validate_request_path,
 };
 
 fn ip(s: &str) -> IpAddr {
@@ -637,10 +637,182 @@ rule github {
 }
 
 #[test]
+fn base64_template_parsing_resolution_formatting_and_validation() {
+    // RFC 4648 Section 10 test vectors
+    assert_eq!(encode_base64(b""), "");
+    assert_eq!(encode_base64(b"f"), "Zg==");
+    assert_eq!(encode_base64(b"fo"), "Zm8=");
+    assert_eq!(encode_base64(b"foo"), "Zm9v");
+    assert_eq!(encode_base64(b"foob"), "Zm9vYg==");
+    assert_eq!(encode_base64(b"fooba"), "Zm9vYmE=");
+    assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
+    assert_eq!(
+        encode_base64(b"x-access-token:ghp_abc123"),
+        "eC1hY2Nlc3MtdG9rZW46Z2hwX2FiYzEyMw=="
+    );
+
+    let config = r#"
+client dev-01 10.0.10.50
+
+rule github-git {
+  from  dev-01
+  to    github.com
+  allow GET  /*/*/info/refs
+  allow POST /*/*/git-upload-pack
+  allow POST /*/*/git-receive-pack
+  set header authorization "Basic ${base64(x-access-token:${secret.github_pat})}"
+  set header x-pair "${base64(${secret.api_user}:${secret.api_pass})}"
+  set header x-key-only "${base64(${secret.api_user}:)}"
+}
+
+rule plain-b64 {
+  from  dev-01
+  to    http://hooks.example.org
+  allow GET /ping
+  set header x-client-b64 "${base64(client:${client.name})}"
+}
+"#;
+    let policy = parse_rules(config).expect("base64 templates should parse");
+    assert_eq!(
+        policy.referenced_secrets(),
+        vec!["github_pat", "api_user", "api_pass"]
+    );
+
+    // Format round-trip preserves Base64 template structure
+    let formatted = format_policy(&policy);
+    let reparsed = parse_rules(&formatted).expect("formatted policy must re-parse");
+    assert_eq!(policy.rules[0].transforms, reparsed.rules[0].transforms);
+    assert_eq!(policy.rules[1].transforms, reparsed.rules[1].transforms);
+
+    // Evaluate GitHub Git rule
+    let decision = policy.evaluate(&EvalRequest {
+        client_ip: ip("10.0.10.50"),
+        scheme: Scheme::Https,
+        host: "github.com",
+        port: 443,
+        method: "GET",
+        path: "/acme/demo.git/info/refs?service=git-upload-pack",
+    });
+    let matched = match decision {
+        Decision::Allow(m) => m,
+        other => panic!("expected Allow, got {other:?}"),
+    };
+    assert_eq!(matched.rule_name, "github-git");
+
+    // Redacted rendering keeps secrets hidden
+    if let Transform::SetHeader { value, .. } = &matched.transforms[0] {
+        assert_eq!(
+            value.render_redacted("dev-01"),
+            "Basic ${base64(x-access-token:${secret.github_pat})}"
+        );
+    } else {
+        panic!("expected SetHeader");
+    }
+
+    let (resolved, derived) = matched
+        .resolve_transforms_with_redactions(|name| match name {
+            "github_pat" => Some("ghp_abc123".into()),
+            "api_user" => Some("u1".into()),
+            "api_pass" => Some("p2".into()),
+            _ => None,
+        })
+        .expect("secrets resolved");
+
+    assert_eq!(
+        resolved,
+        vec![
+            ResolvedTransform::SetHeader {
+                name: "authorization".into(),
+                value: "Basic eC1hY2Nlc3MtdG9rZW46Z2hwX2FiYzEyMw==".into(),
+            },
+            ResolvedTransform::SetHeader {
+                name: "x-pair".into(),
+                value: encode_base64(b"u1:p2"),
+            },
+            ResolvedTransform::SetHeader {
+                name: "x-key-only".into(),
+                value: encode_base64(b"u1:"),
+            },
+        ]
+    );
+    assert_eq!(
+        derived,
+        vec![
+            "eC1hY2Nlc3MtdG9rZW46Z2hwX2FiYzEyMw==".to_string(),
+            encode_base64(b"u1:p2"),
+            encode_base64(b"u1:"),
+        ]
+    );
+
+    // Non-secret base64 works over HTTP and does not add derived secret redactions
+    let plain_decision = policy.evaluate(&EvalRequest {
+        client_ip: ip("10.0.10.50"),
+        scheme: Scheme::Http,
+        host: "hooks.example.org",
+        port: 80,
+        method: "GET",
+        path: "/ping",
+    });
+    let plain_matched = match plain_decision {
+        Decision::Allow(m) => m,
+        other => panic!("expected Allow, got {other:?}"),
+    };
+    if let Transform::SetHeader { value, .. } = &plain_matched.transforms[0] {
+        assert_eq!(value.render_redacted("dev-01"), "${base64(client:dev-01)}");
+    }
+    let (plain_resolved, plain_derived) = plain_matched
+        .resolve_transforms_with_redactions(|_| None)
+        .expect("no secret needed");
+    assert_eq!(
+        plain_resolved,
+        vec![ResolvedTransform::SetHeader {
+            name: "x-client-b64".into(),
+            value: encode_base64(b"client:dev-01"),
+        }]
+    );
+    assert!(plain_derived.is_empty());
+
+    // Static validation errors for base64 templates
+    let bad_cases: &[(&str, &str)] = &[
+        (
+            "client a 10.0.0.1\nrule r {\n  from a\n  to http://api.example.com\n  allow GET /\n  set header authorization \"Basic ${base64(u:${secret.k})}\"\n}\n",
+            "non-HTTPS",
+        ),
+        (
+            "client a 10.0.0.1\nrule r {\n  from a\n  to *.example.com\n  allow GET /\n  set header authorization \"Basic ${base64(u:${secret.k})}\"\n}\n",
+            "wildcard",
+        ),
+        (
+            "client a 10.0.0.1\nrule r {\n  from a\n  to api.example.com\n  allow GET /\n  set header x-a \"${base64(foo${base64(bar)})}\"\n}\n",
+            "nested",
+        ),
+        (
+            "client a 10.0.0.1\nrule r {\n  from a\n  to api.example.com\n  allow GET /\n  set header x-a \"${base64()}\"\n}\n",
+            "must not be empty",
+        ),
+        (
+            "client a 10.0.0.1\nrule r {\n  from a\n  to api.example.com\n  allow GET /\n  set header x-a \"${base64(u:${secret.k}}\"\n}\n",
+            "unclosed",
+        ),
+        (
+            "client a 10.0.0.1\nrule r {\n  from a\n  to api.example.com\n  allow GET /\n  set header x-a \"${base64(${env.HOME})}\"\n}\n",
+            "unknown variable",
+        ),
+    ];
+    for (input, expected) in bad_cases {
+        let err = parse_rules(input).expect_err(&format!("should fail:\n{input}"));
+        assert!(
+            err.message.contains(expected),
+            "expected error containing '{expected}', got '{err}' for:\n{input}"
+        );
+    }
+}
+
+#[test]
 fn rules_example_conf_is_valid() {
     let example = include_str!("../rules.example.conf");
     let policy = parse_rules(example).expect("rules.example.conf must be valid");
     assert_eq!(policy.clients.len(), 2);
-    assert_eq!(policy.rules.len(), 4);
+    assert_eq!(policy.rules.len(), 5);
     assert_eq!(policy.referenced_secrets(), vec!["stripe_key", "github_pat"]);
 }
