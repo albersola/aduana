@@ -1,11 +1,25 @@
 # Aduana
 
-A lightweight outbound HTTP/HTTPS proxy for self-hosted servers, in a single Rust binary.
+**Egress traffic filter and proxy for AI agents that injects credentials into outgoing HTTPS requests.**
+
+Give your agents access to the APIs they need without ever handing them the keys. Aduana sits between your self-hosted servers and the internet: it blocks everything you have not allowed, inspects HTTPS traffic and injects the secrets in flight, so a compromised agent has nothing to leak. A lightweight proxy in a single Rust binary.
 
 - **Explicit allowlist**: blocks all unauthorized outbound traffic by default.
+- **Credential injection**: adds or replaces headers on the way out, so API secrets never reach the clients.
 - **HTTPS inspection**: terminates TLS with an internal CA that your servers trust.
-- **In-flight transformations**: adds or replaces headers, such as API secrets the clients never see.
 - **Logging and auditing**: records allowed requests and blocked attempts.
+
+```mermaid
+flowchart LR
+    agent["AI agent<br/>no secrets"] -->|"HTTPS_PROXY<br/>CONNECT"| aduana
+    subgraph aduana["Aduana"]
+        direction TB
+        allow{"Allowlist"} -->|allowed| inject["Inject credentials<br/>from secrets.env"]
+    end
+    allow -.->|blocked| log[("Audit log")]
+    inject --> api["External API<br/>api.stripe.com"]
+    inject -.-> log
+```
 
 ## Installing
 
