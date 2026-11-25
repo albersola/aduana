@@ -18,6 +18,12 @@ use crate::rules::{
 };
 use crate::secrets::SecretStore;
 
+/// Version of the GitHub release this binary was built for, or the development version in `Cargo.toml`.
+pub const VERSION: &str = match option_env!("ADUANA_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/aduana/rules.conf";
 pub const DEFAULT_CA_KEY_PATH: &str = "/etc/aduana/ca/ca.key";
 pub const DEFAULT_CA_CERT_PATH: &str = "/etc/aduana/ca.crt";
@@ -33,7 +39,7 @@ pub fn run(args: &[String]) -> ExitCode {
 
     match cmd {
         "--version" | "-V" => {
-            println!("aduana {}", env!("CARGO_PKG_VERSION"));
+            println!("aduana {VERSION}");
             ExitCode::SUCCESS
         }
         "--help" | "-h" => {
@@ -96,10 +102,7 @@ pub fn run(args: &[String]) -> ExitCode {
 }
 
 fn print_help() {
-    println!(
-        "aduana {} — outbound HTTP/HTTPS proxy",
-        env!("CARGO_PKG_VERSION")
-    );
+    println!("aduana {VERSION} — outbound HTTP/HTTPS proxy");
     println!();
     println!("Uso: aduana <comando> [opciones]");
     println!();

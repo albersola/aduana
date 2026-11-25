@@ -1,0 +1,92 @@
+name: Release
+
+# Publishing a GitHub release builds that version and attaches its files.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ github.event.release.tag_name }}
+
+jobs:
+  # Back to draft until the files are attached, so `releases/latest` never points to an incomplete
+  # release. If the tests fail, it stays as a draft.
+  hold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Turn the release into a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$VERSION" --draft=true
+
+      - name: Check the version format
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The release tag must look like 1.2.3, got '$VERSION'"
+            exit 1
+          fi
+
+  build:
+    needs: hold
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust target
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build static binary
+        env:
+          ADUANA_VERSION: ${{ env.VERSION }}
+        run: cargo build --release --locked
+
+      - name: Prepare release files
+        run: |
+          mkdir dist
+          cp target/x86_64-unknown-linux-musl/release/aduana dist/aduana-linux-amd64
+          cp scripts/install.sh dist/install.sh
+          test "$(dist/aduana-linux-amd64 --version)" = "aduana $VERSION"
+          cd dist
+          sha256sum aduana-linux-amd64 install.sh > SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+
+      - name: Attach files and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "$VERSION" dist/* --clobber
+          gh release edit "$VERSION" --draft=false
