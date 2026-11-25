@@ -16,4 +16,5 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) (semantic commi
 | Document | Description | When to read it |
 | --- | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | System overview, design principles and boundaries between the proxy and the infrastructure (Proxmox, DNS, CA). | Before designing components, changing system boundaries or adding new capabilities. |
+| [docs/rules.md](docs/rules.md) | Syntax and semantics of `rules.conf`, header transforms, templates (`${secret.*}`, `${base64(...)}`) and `secrets.env`. | Before changing the rules grammar, templates, validation or secret handling. |
 | [docs/security.md](docs/security.md) | Threat model (client compromised up to `root`), trust boundary and table of evasion vectors and defenses. | Before designing network/protocol validations, secret management, certificates or evasion tests. |

@@ -32,6 +32,12 @@ sudo ./scripts/install.sh                 # install the compiled binary and star
 
 When it finishes, the script prints the manual steps to install `/etc/aduana/ca.crt` and to configure `HTTP_PROXY` / `HTTPS_PROXY` on each client server.
 
+## Documentation
+
+- [Rules reference](docs/rules.md) — syntax for `rules.conf`, templates (`${secret.*}`, `${base64(...)}`) and `secrets.env` (see also [rules.example.conf](rules.example.conf))
+- [Architecture](docs/architecture.md)
+- [Security and threat model](docs/security.md)
+
 ## License
 
 [MIT](LICENSE)
